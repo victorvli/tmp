@@ -1,14 +1,91 @@
-**DeepSeek Harness（dsh）**是深度求索（DeepSeek AI）开发的**开源 Agent Harness（智能体框架）**，采用 MIT 许可证，以 TypeScript 编写，于 2026 年 8 月正式开源，目前处于开发者预览阶段（官方提示未来将有破坏兼容性的变更）。
+时间可组合性是这篇文章的主线。剩下的事情——Fiber、effect、系统边界、preset、Code Mode——都在回答同一个问题：怎么在工程上实现"卸载 = 完整逆转"。Cordis 生态还带了几个配套包，随项目一起 vendor 进来：一个配置文件加载器（负责解析 cordis.yml 这类声明式配置），一个 include 插件（负责把一份配置当成子树挂载进来，preset 机制用的就是它改名后的版本），一个 HMR 模块（支持插件热替换），外加日志和定时器这两个基础设施插件。这几块拼起来，才能真正理解"everything is a plugin"。
 
-它不优化模型本身，而是优化模型运行的环境。核心哲学五个字：**一切皆插件（Everything is a Plugin）**。
+Cordis 里，插件的类型定义是一个联合类型：type Plugin<T> = Plugin.Function<T> | Plugin.Constructor<T> | Plugin.Object<T>
+裸函数、类、带 apply 方法的对象，三种写法最终都被解析成一个统一的回调。挂载一个插件调用 ctx.plugin(plugin, config)，内部先找有没有已经存在的 Runtime 记录（按回调函数身份做 key，同一个插件多次挂载共享同一条 Runtime），没有就新建，再造一个 Fiber，塞进这条 Runtime 的 fibers 列表里。Fiber 是插件实例的生命周期状态机，六个状态：PENDING、LOADING、ACTIVE、FAILED、DISPOSED、UNLOADING。插件声明了 inject: ['tools', 'shell']，对应的 Fiber 会停在 PENDING，直到这两个服务都在依赖链上出现，才真正跑这个插件的代码，进入 ACTIVE。这套等待机制是 Cordis 自己实现的依赖解析，插件作者不需要手写"等对方准备好"的轮询逻辑。这对应空间可组合性：依赖出现后，组件自动激活。卸载一个插件是否安全，由 effect 机制决定。插件注册的任何东西——事件监听、服务、定时器——都通过 ctx.effect() 登记。登记时立刻执行一次，返回的撤销函数被推进一个 disposables 列表。论文 5.1.1 指出：Cordis 中每一次上下文变更都通过唯一原语 ctx.effect 完成——提供服务、实例化组件、所有修改上下文的操作都归约成一次 ctx.effect 调用。用法长这样：ctx.effect(() => {
+  // 做副作用：注册监听、开定时器、提供服务……
+  return () => { /* 逆：撤销上面的操作 */ }   // 返回 disposer
+})
+callback 可以返回一个 disposer 函数、一个 Promise，或者一个（异步）迭代器，逐段 yield disposer——每做一步副作用就交一个撤销函数。
 
-模型、工具、技能、会话、沙箱、存储、循环（agent loop）、调度、UI 等**所有 Agent 能力均由插件提供**，通过 Cordis 内核的服务（Service）与事件（Event）彼此协作——开发者无需改动任何源码，就能在配置层选择、替换、扩展任一能力。
 
-DeepSeek Harness 并非新的 DeepSeek 模型，也非一个单纯的 API 客户端。它是一套用来构建、运行和扩展智能体的 SDK 与应用框架，默认可以连接 DeepSeek 模型（也可方便地自定义连接其它模型），让模型读取项目、修改文件、运行命令、管理任务、分配子任务，并通过 Web UI、全屏终端、Headless 命令或自动化协议与用户交互。
+下面的时序图清晰地展示了从加载到卸载的完整流程：
 
-放到 DeepSeek Harness 里的语境里，“一切皆插件”的意思就是：模型怎么接、工具怎么调用、会话如何保持、对话怎么记忆、交互怎么呈现，甚至 Agent 主循环本身，全都计划做成可以插拔的组件，把插件细颗粒度化这件事做到了极致，出发点是让 Agent 的运行足够透明，在 Trajectory 视图里，实现 Agent 的每一次运行都有迹可循，全部可回放、可分叉、可审计，从而大幅降低 Agent 体验和成本优化的复杂度。插件化颗粒度越细，黑盒越少，运行越透明，我们看的越清，Agent 的优化空间也就越大。
+sequenceDiagram
+    participant Config as 配置/用户
+    participant Cordis as Cordis 框架
+    participant Fiber as Fiber (状态机)
+    participant Plugin as 插件实例
+    participant Effect as Effect (副作用)
 
+    Config->>Cordis: 1. 声明加载插件
+    Cordis->>Fiber: 2. 创建Fiber，状态: PENDING
+    Note over Fiber: 依赖检查 (inject)
+    Fiber->>Fiber: 3. 依赖就绪，状态: LOADING
+    Fiber->>Plugin: 4. 执行 apply(ctx)
+    Plugin->>Effect: 5. 注册资源 (ctx.effect/ctx.on)
+    Effect-->>Plugin: 返回 disposer (撤销函数)
+    Plugin-->>Fiber: 6. 加载完成，状态: ACTIVE
+    Note over Plugin: 插件运行中
 
-Cordis 不是 DeepSeek 临时起意造的，它有十年的社区血统：作者是 Shigma（史一凡），北大出身、DeepSeek 成员，也是知名聊天机器人框架 Koishi 的创始人。Koishi 2020 年发布，社区积累了 3000+ 插件，Cordis 就是 2022 年从 Koishi 里抽出来的插件微内核，Koishi 至今是它最大的实战验证案例。定位是"Meta-Framework for Modern JavaScript Applications"，一个通用的插件框架，处理依赖注入、作用域服务、生命周期清理这几件事，与 agent、与 LLM 都没有直接关系，在 DeepSeek Harness 出现之前就已经存在。Cordis 在开源社区有实际的使用者。最典型的是 Koishi，一个跨平台聊天机器人框架（QQ / Discord / Telegram / 微信都接）。聊天机器人场景天然是"几十个插件拼在一起、热插拔、随时改配置"，与 agent 的场景几乎相同，只是没有 LLM。DeepSeek Harness 把整个框架的源码 vendor 进自己的仓库，改了个 scope 叫 @deepseek-ai/cordis，然后把公司自己写的每一个包，都设成对它的 peer dependency。这比"使用一个第三方库"更进一步：整个产品都构建在 cordis 之上。
+    Config->>Cordis: 7. 触发卸载 (HMR/移除/依赖丢失)
+    Cordis->>Fiber: 8. 状态: UNLOADING
+    Fiber->>Effect: 9. 逆序执行 disposer
+    Effect-->>Fiber: 10. 资源清理完成
+    Fiber->>Fiber: 11. 状态: DISPOSED
 
-先对比几种常见的插件形态：传统 DI 容器、轻量钩子方案、Cordis。这三种方案各有取舍，值得摆在一起看。传统 DI 容器的三个缺口。 "主流"方案是一个 DI 容器加生命周期注解。你 bind 了一个 service，谁来负责 unbind 和 cleanup？传统 DI 要么不管（泄漏），要么要求你手写 lifecycle hook。LLM provider 热替换了，依赖它的 ToolRegistry 应该自动重启，传统 DI 做不到这种"依赖驱动的重载"。配置上，传统 DI 的配置在启动时读一次；而 cordis.yml 里一行就是一个插件实例，改配置直接触发 HMR。Pi也是Agent界的明星产品了，但Pi 的 Extension 走的是另一条路。 Pi 的自我定位是 "self extensible coding agent"，它的插件叫 Extension（扩展），基于 TS，在扩展点上通过钩子塞逻辑：没有依赖注入，没有插件间依赖管理（加载顺序即优先级），也不能卸载。Cordis 的插件是带依赖声明、生命周期、可逆副作用的"组件"：有依赖注入，有反应性 coeffects，插件间可以声明依赖，卸载时能完整逆转副作用。这最后一点——"可逆副作用"——是整篇文章的地基。Cordis 的设计论文把这件事上升到理论层面，核心问题问得很直接：有没有一种 programming model，能让动态本身具备类似进程那样的生命周期隔离？进程和容器的好处在于：kill 掉再启动，状态就清空了。代价是重启会丢掉进程内的 cache、connection、partial computation。插件系统希望不用重启，也能完成同样的清理。论文为此给了两个定义：时间可组合性：卸载组件时，组件对共享环境所做的修改必须被完整、安全地逆转——这要求追踪组件执行的每一次资源分配、事件注册和状态变更。空间可组合性：依赖变化时，相关组件自动激活或停用。时间可组合性是这篇文章的主线。剩下的事情——Fiber、effect、系统边界、preset、Code Mode——都在回答同一个问题：怎么在工程上实现"卸载 = 完整逆转"。Cordis 生态还带了几个配套包，随项目一起 vendor 进来：一个配置文件加载器（负责解析 cordis.yml 这类声明式配置），一个 include 插件（负责把一份配置当成子树挂载进来，preset 机制用的就是它改名后的版本），一个 HMR 模块（支持插件热替换），外加日志和定时器这两个基础设施插件。这几块拼起来，才能真正理解"everything is a plugin"。
+1. 核心：Fiber 状态机与依赖驱动
+每个插件实例在运行时都被封装在一个叫做 Fiber 的执行单元中。它如同一个“生命周期管家”，精确控制着插件的状态流转。
+
+六大核心状态：
+
+PENDING（等待）：插件已声明，但其 inject 字段声明的依赖服务尚未就绪。这是防止加载顺序问题的关键。
+
+LOADING（加载中）：所有依赖已满足，正在执行插件的 apply 函数。
+
+ACTIVE（激活）：apply 函数执行完毕，插件正常运行。
+
+FAILED（失败）：apply 函数执行或配置校验过程中抛出错误。
+
+UNLOADING（卸载中）：正在执行清理工作。
+
+DISPOSED（已销毁）：所有资源已释放，插件生命周期终结。
+
+2. 关键机制：可逆副作用 (Effect)
+DeepSeek Harness 能实现“干净”卸载的核心奥秘在于 “可逆副作用”。它要求插件对系统产生的任何影响（即副作用）都必须登记在案，并附带一个精确的“逆操作”（撤销函数）。
+
+规范做法：插件不应该直接操作外部资源（如启动定时器、监听事件、注册工具）。所有操作都必须通过 Cordis 提供的 ctx.effect() API 或封装好的注册 API（如 ctx.on, ctx.tools.register）来完成。
+
+撤销函数的注册：
+
+typescript
+// 官方文档示例 [citation:2]
+export function apply(ctx: Context) {
+  // 注册一个副作用，并返回其撤销函数
+  ctx.effect(() => {
+    // 1. 执行副作用：启动一个定时器
+    const timer = setInterval(() => console.log('tick'), 200);
+    
+    // 2. 返回撤销函数：用于清理这个副作用
+    return () => {
+      clearInterval(timer); // 清理定时器
+      console.log('heartbeat cleaned up');
+    };
+  });
+}
+这种模式将“创建”与“销毁”的逻辑放在一起，被称为“关注点局部性”。
+
+3. 卸载与清理流程
+当一个插件被卸载（无论是因为用户禁用、配置变更、热替换还是其依赖服务消失），Cordis 会执行一套严格的清理流程。
+
+触发：Fiber 状态变为 UNLOADING。
+
+逆序清理：Cordis 会找出该 Fiber 及其所有子 Fiber 在生命周期中注册的全部撤销函数，并按照注册的相反顺序依次执行。这被称为“后进先出”（LIFO）策略，确保了清理的顺序性。
+
+级联卸载：如果一个插件通过 ctx.plugin() 挂载了子插件，那么父插件在卸载时会自动触发其所有子插件的卸载，形成一个递归的、完整的清理链条。
+
+终结：所有撤销函数执行完毕后，Fiber 进入 DISPOSED 状态，插件实例可以被垃圾回收。
+
+4. 生命周期中的特殊场景
+热模块替换 (HMR)：这是“可逆副作用”带来的关键能力。当代码或配置变更时，Cordis 会先完整卸载（DISPOSED）旧插件，清理其所有副作用，然后再加载（PENDING -> ACTIVE）新插件。这个过程无需重启整个进程。
+
+依赖驱动：如果一个 ACTIVE 状态的插件所依赖的服务被卸载，它也会自动进入 UNLOADING 并最终变为 DISPOSED 状态。待该服务重新出现后，它又可以自动重新加载。这保证了系统状态的一致性。
